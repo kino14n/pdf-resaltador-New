@@ -56,7 +56,7 @@ def buscar_y_resaltar(pdf_path, codigos):
 
     # Fallback OCR
     if codigos_no_encontrados:
-        images = convert_from_path(pdf_path)
+       images = convert_from_path(pdf_path, dpi=120)  # menor DPI, menos RAM, más rápido
         for page_num, image in enumerate(images):
             if not codigos_no_encontrados:
                 break
