@@ -39,31 +39,35 @@ def buscar_y_resaltar(pdf_path, codigos):
     paginas_resaltadas = set()
     codigos_encontrados = {}
     codigos_no_encontrados = set(codigos)
+    paginas_por_codigo = {codigo: set() for codigo in codigos}
 
-    # Búsqueda texto directo
+    # 1. Búsqueda exacta en texto plano (PyMuPDF)
     for page_num in range(len(doc)):
         pagina = doc[page_num]
+        page_text = pagina.get_text()
         for codigo in list(codigos_no_encontrados):
-            rects = pagina.search_for(codigo)
-            if rects:
-                for r in rects:
-                    highlight = pagina.add_highlight_annot(r)
-                    highlight.set_colors(stroke=(0,1,0))
-                    highlight.update()
-                paginas_resaltadas.add(page_num)
-                codigos_encontrados.setdefault(codigo, []).append(page_num + 1)
-                codigos_no_encontrados.remove(codigo)
+            if codigo in page_text:
+                rects = pagina.search_for(codigo)
+                if rects:
+                    for r in rects:
+                        highlight = pagina.add_highlight_annot(r)
+                        highlight.set_colors(stroke=(0,1,0))
+                        highlight.update()
+                    paginas_resaltadas.add(page_num)
+                    codigos_encontrados.setdefault(codigo, []).append(page_num + 1)
+                    paginas_por_codigo[codigo].add(page_num)
+                    codigos_no_encontrados.remove(codigo)
 
-    # Fallback OCR
+    # 2. Solo si faltan códigos, procesar OCR
     if codigos_no_encontrados:
         images = convert_from_path(pdf_path, dpi=120)
-        for page_num, image in enumerate(images):
-            if not codigos_no_encontrados:
-                break
-            texto_ocr = image_to_string(image)
-            pagina = doc[page_num]
-            for codigo in list(codigos_no_encontrados):
+        for codigo in list(codigos_no_encontrados):
+            for page_num, image in enumerate(images):
+                if page_num in paginas_por_codigo[codigo]:
+                    continue  # Ya encontrado por texto plano
+                texto_ocr = image_to_string(image)
                 if codigo in texto_ocr:
+                    pagina = doc[page_num]
                     rects = pagina.search_for(codigo)
                     for r in rects:
                         highlight = pagina.add_highlight_annot(r)
@@ -72,6 +76,7 @@ def buscar_y_resaltar(pdf_path, codigos):
                     paginas_resaltadas.add(page_num)
                     codigos_encontrados.setdefault(codigo, []).append(page_num + 1)
                     codigos_no_encontrados.remove(codigo)
+                    break  # No hace falta buscar en más páginas para este código
 
     if not paginas_resaltadas:
         doc.close()
