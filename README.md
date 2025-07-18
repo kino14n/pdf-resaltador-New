@@ -27,4 +27,4 @@ Abrir navegador en http://localhost:5000, subir PDF y poner códigos separados p
 
 Se puede desplegar en Render, Railway, Heroku, etc.
 
-tu puedes
+tu puedes tu si puedes
