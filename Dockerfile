@@ -17,11 +17,11 @@ COPY . /app
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
-# Expone el puerto
-EXPOSE 10000
+# Exponer el puerto (opcional, Render lo detecta, pero ayuda a clarity)
+EXPOSE 8080
 
-# Toma el puerto de la variable de entorno (Render y Railway lo configuran)
-ENV PORT=10000
+# Usa la variable de entorno PORT si existe, si no 8080
+ENV PORT=8080
 
 # Comando para iniciar Gunicorn usando la variable PORT
 CMD exec gunicorn app:app -b 0.0.0.0:${PORT}
