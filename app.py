@@ -144,7 +144,7 @@ def descargar(filename):
     if not os.path.exists(path):
         flash('Archivo no encontrado para descargar.', 'error')
         return redirect(url_for('index'))
-    return send_file(path, as_attachment=True)
+    return send_file(path, as_attachment=False)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
