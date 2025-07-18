@@ -26,3 +26,5 @@ Abrir navegador en http://localhost:5000, subir PDF y poner códigos separados p
 ## Deploy
 
 Se puede desplegar en Render, Railway, Heroku, etc.
+
+tu puedes
