@@ -3,7 +3,7 @@ import re
 import tempfile
 import uuid
 
-import fitz
+import fitz  # PyMuPDF
 from flask import Flask, request, render_template, send_file, flash, redirect, url_for
 from werkzeug.utils import secure_filename
 from pdf2image import convert_from_path
@@ -56,8 +56,7 @@ def buscar_y_resaltar(pdf_path, codigos):
 
     # Fallback OCR
     if codigos_no_encontrados:
-    images = convert_from_path(pdf_path, dpi=120)
-    for page_num, image in enumerate(images):
+        images = convert_from_path(pdf_path, dpi=120)
         for page_num, image in enumerate(images):
             if not codigos_no_encontrados:
                 break
@@ -142,6 +141,6 @@ def descargar(filename):
         return redirect(url_for('index'))
     return send_file(path, as_attachment=True)
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(debug=True, host='0.0.0.0', port=port)
