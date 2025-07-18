@@ -1,3 +1,4 @@
+python-3.10.10
 Flask==2.3.2
 PyMuPDF==1.22.5
 pytesseract==0.3.10
