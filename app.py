@@ -45,7 +45,11 @@ def buscar_y_resaltar(pdf_path, codigos):
             if rects:
                 paginas_con_codigos.add(page.number)
                 highlight = page.add_highlight_annot(rects)
-                highlight.set_colors(stroke=(0, 1, 0))  # Verde
+                
+                # --- LÍNEA MODIFICADA ---
+                # Cambiado de (0, 1, 0) a (0, 0.5, 0) para un verde más oscuro
+                highlight.set_colors(stroke=(0, 0.5, 0)) 
+                
                 highlight.update()
                 
                 # Guardar en qué página se encontró
