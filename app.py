@@ -3,10 +3,8 @@ import re
 import tempfile
 import uuid
 import fitz  # PyMuPDF
-from flask import Flask, request, render_template, send_file, flash, redirect, url_for, after_this_request, jsonify
+from flask import Flask, request, render_template, send_file, flash, redirect, url_for, after_this_request
 from werkzeug.utils import secure_filename
-from pdf2image import convert_from_path
-from pytesseract import image_to_string
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'clave-secreta-para-desarrollo')
@@ -27,99 +25,125 @@ def limpiar_codigos(codigos_raw):
     codigos = []
     if not codigos_raw:
         return codigos
-    for c in re.split(r'[\n,]+', codigos_raw):
+    # Se usa re.split para manejar comas y saltos de línea como separadores
+    for c in re.split(r'[\\n,]+', codigos_raw):
         c = c.strip()
         if c:
             codigos.append(c)
-    return codigos
+    return list(set(codigos)) # Devuelve códigos únicos
 
 def buscar_y_resaltar(pdf_path, codigos):
     doc = fitz.open(pdf_path)
     paginas_con_codigos = set()
     
-    # 1. Búsqueda por texto directo
+    encontrados = {} # {'codigo': [página1, página2]}
+    
+    # Búsqueda por texto directo
     for page in doc:
         for codigo in codigos:
-            rects = page.search_for(codigo)
+            rects = page.search_for(codigo, quads=True) # Búsqueda exacta
             if rects:
                 paginas_con_codigos.add(page.number)
-                for rect in rects:
-                    highlight = page.add_highlight_annot(rect)
-                    highlight.set_colors(stroke=(0, 1, 0))  # Verde
-                    highlight.update()
+                highlight = page.add_highlight_annot(rects)
+                highlight.set_colors(stroke=(0, 1, 0))  # Verde
+                highlight.update()
+                
+                # Guardar en qué página se encontró
+                if codigo not in encontrados:
+                    encontrados[codigo] = []
+                # Añadir número de página real (page.number + 1)
+                if page.number + 1 not in encontrados[codigo]:
+                    encontrados[codigo].append(page.number + 1)
 
-    # 2. Búsqueda por OCR si es necesario (ejemplo básico)
-    # Esta parte se puede expandir si la búsqueda de texto no es suficiente
-    
+    # Determinar qué códigos no se encontraron
+    codigos_encontrados = set(encontrados.keys())
+    no_encontrados = [c for c in codigos if c not in codigos_encontrados]
+
     if not paginas_con_codigos:
         doc.close()
-        return None
+        # Devuelve que no se creó archivo, los encontrados (vacío) y los no encontrados (todos)
+        return None, encontrados, no_encontrados
 
     # Crear un nuevo PDF solo con las páginas que tienen resaltados
     doc_nuevo = fitz.open()
     for page_num in sorted(list(paginas_con_codigos)):
         doc_nuevo.insert_pdf(doc, from_page=page_num, to_page=page_num)
     
-    out_path = os.path.join(app.config['PROCESSED_FOLDER'], f"resaltado_{uuid.uuid4().hex}.pdf")
-    doc_nuevo.save(out_path)
+    out_filename = f"resaltado_{uuid.uuid4().hex}.pdf"
+    out_path = os.path.join(app.config['PROCESSED_FOLDER'], out_filename)
+    doc_nuevo.save(out_path, garbage=4, deflate=True, clean=True)
     doc_nuevo.close()
     doc.close()
-    return out_path
-
-@app.route('/api/resaltar', methods=['POST'])
-def api_resaltar():
-    if 'pdf_file' not in request.files:
-        return jsonify({"error": "No se encontró el archivo PDF en la petición"}), 400
     
-    pdf_file = request.files['pdf_file']
-    codigos_raw = request.form.get('codes', '')
-    
-    if not pdf_file.filename or not allowed_file(pdf_file.filename):
-        return jsonify({"error": "El archivo proporcionado no es un PDF válido"}), 400
+    # Devuelve la ruta del archivo, los códigos encontrados y los no encontrados
+    return out_path, encontrados, no_encontrados
 
-    codigos = limpiar_codigos(codigos_raw)
-    if not codigos:
-        return jsonify({"error": "No se proporcionaron códigos para resaltar"}), 400
-
-    filename = secure_filename(pdf_file.filename)
-    input_pdf_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{uuid.uuid4().hex}_{filename}")
-    pdf_file.save(input_pdf_path)
-    
-    resultado_pdf_path = None
-    try:
-        resultado_pdf_path = buscar_y_resaltar(input_pdf_path, codigos)
-
-        if not resultado_pdf_path:
-            return jsonify({"error": "No se encontraron los códigos en el PDF"}), 404
-        
-        @after_this_request
-        def cleanup(response):
-            try:
-                if os.path.exists(resultado_pdf_path):
-                    os.remove(resultado_pdf_path)
-            except Exception as e:
-                app.logger.error(f"Error eliminando archivo procesado {resultado_pdf_path}: {e}")
-            return response
-            
-        return send_file(resultado_pdf_path, as_attachment=True, download_name=f"resaltado_{filename}")
-
-    except Exception as e:
-        app.logger.error(f"Error en buscar_y_resaltar: {e}")
-        return jsonify({"error": f"Ocurrió un error interno al procesar el PDF"}), 500
-    finally:
-        try:
-            if os.path.exists(input_pdf_path):
-                os.remove(input_pdf_path)
-        except Exception as e:
-            app.logger.error(f"Error eliminando archivo subido {input_pdf_path}: {e}")
-
-# La interfaz web original sigue funcionando por si la necesitas
 @app.route('/', methods=['GET', 'POST'])
 def index():
+    # Inicializa las variables para pasarlas siempre al template
+    render_context = {
+        'encontrados': None,
+        'no_encontrados': None,
+        'resultado_pdf': None
+    }
+
     if request.method == 'POST':
-        # ... (la lógica del POST de la interfaz web se mantiene sin cambios)
-        pass
-    return render_template('index.html')
+        if 'pdf_file' not in request.files:
+            flash('No se seleccionó ningún archivo.', 'error')
+            return redirect(request.url)
+        
+        pdf_file = request.files['pdf_file']
+        codigos_raw = request.form.get('specific_codes', '')
+
+        if pdf_file.filename == '':
+            flash('No se seleccionó ningún archivo.', 'error')
+            return redirect(request.url)
+
+        if not allowed_file(pdf_file.filename):
+            flash('El archivo proporcionado no es un PDF válido.', 'error')
+            return redirect(request.url)
+        
+        codigos = limpiar_codigos(codigos_raw)
+        if not codigos:
+            flash('No se proporcionaron códigos para resaltar.', 'error')
+            return redirect(request.url)
+
+        filename = secure_filename(pdf_file.filename)
+        input_pdf_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{uuid.uuid4().hex}_{filename}")
+        pdf_file.save(input_pdf_path)
+        
+        try:
+            # La función ahora devuelve tres valores
+            resultado_pdf_path, encontrados, no_encontrados = buscar_y_resaltar(input_pdf_path, codigos)
+            
+            # Actualiza el contexto con los resultados
+            render_context['encontrados'] = encontrados
+            render_context['no_encontrados'] = no_encontrados
+
+            if resultado_pdf_path:
+                render_context['resultado_pdf'] = os.path.basename(resultado_pdf_path)
+                flash('Procesamiento completado.', 'success')
+            else:
+                flash('No se encontró ninguno de los códigos en el documento.', 'error')
+
+            @after_this_request
+            def cleanup(response):
+                try:
+                    if os.path.exists(input_pdf_path):
+                        os.remove(input_pdf_path)
+                except Exception as e:
+                    app.logger.error(f"Error limpiando archivo subido: {e}")
+                return response
+            
+        except Exception as e:
+            app.logger.error(f"Error crítico en el procesamiento del PDF: {e}")
+            flash(f'Ocurrió un error inesperado al procesar el PDF: {e}', 'error')
+        
+        # Renderiza la misma página pero con los resultados
+        return render_template('index.html', **render_context)
+
+    # Para el método GET, simplemente muestra la página inicial
+    return render_template('index.html', **render_context)
 
 @app.route('/descargar/<path:filename>')
 def descargar(filename):
@@ -127,7 +151,7 @@ def descargar(filename):
     if os.path.exists(path):
         return send_file(path, as_attachment=False)
     else:
-        flash('El archivo solicitado no existe.', 'error')
+        flash('El archivo solicitado no existe o ya ha sido eliminado.', 'error')
         return redirect(url_for('index'))
 
 if __name__ == '__main__':
