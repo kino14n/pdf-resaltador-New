@@ -3,92 +3,99 @@ import re
 from flask import Flask, request, make_response, render_template, flash, redirect, url_for
 import os
 import json
+import logging
+
+# Configuración de logging para que se vea en Railway
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
-# Es una buena práctica usar una clave secreta desde las variables de entorno para producción.
 app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
 
 def highlight_codes_on_page(page, codes_to_find):
     """
-    Busca y resalta códigos en una página de forma case-insensitive (ignorando mayúsculas/minúsculas).
-    Esta función es más robusta porque busca el texto completo en lugar de palabra por palabra.
+    Busca y resalta códigos en una página de forma case-insensitive.
     """
     found_on_page = False
-    
-    # Iterar sobre cada código que necesitamos encontrar
+    page_text = page.get_text("text").lower() # Obtener todo el texto de la página en minúsculas
+
+    # Log para ver el texto extraído (solo los primeros 300 caracteres)
+    app.logger.info(f"--- Texto extraído de la página (primeros 300 chars): '{page_text[:300]}...'")
+
+    # Si la página casi no tiene texto, probablemente es una imagen.
+    if len(page_text.strip()) < 20:
+        app.logger.warning(f"La página {page.number + 1} tiene muy poco texto. Puede que sea una imagen escaneada.")
+
     for code in codes_to_find:
-        # Usar la función search_for con la bandera re.IGNORECASE para la búsqueda
-        # El flag re.IGNORECASE hace que la búsqueda no distinga entre mayúsculas y minúsculas.
-        text_instances = page.search_for(code, flags=re.IGNORECASE)
-        
-        # Si se encontraron instancias de este código, resaltarlas
-        if text_instances:
-            found_on_page = True
-            for inst in text_instances:
-                # Crear un rectángulo sobre el texto encontrado y añadir el resaltado
-                highlight = page.add_highlight_annot(inst)
-    
+        # Buscar el código (en minúsculas) dentro del texto de la página
+        if code.lower() in page_text:
+            app.logger.info(f"¡COINCIDENCIA ENCONTRADA! Buscando '{code}' en la página {page.number + 1}.")
+            # Usar search_for para obtener las coordenadas exactas y resaltar
+            text_instances = page.search_for(code, flags=re.IGNORECASE)
+            
+            if text_instances:
+                found_on_page = True
+                for inst in text_instances:
+                    highlight = page.add_highlight_annot(inst)
+                app.logger.info(f"Resaltadas {len(text_instances)} instancia(s) de '{code}'.")
+        else:
+            # Log si un código específico no se encuentra en el texto de la página
+            app.logger.info(f"El código '{code}' no se encontró en la página {page.number + 1}.")
+            
     return found_on_page
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
     if request.method == 'POST':
-        # Validar que el archivo y los códigos fueron enviados
+        app.logger.info("="*50)
+        app.logger.info("Nueva solicitud POST recibida para resaltar PDF.")
+
         if 'pdf_file' not in request.files:
-            flash('No se envió ningún archivo PDF.', 'error')
-            return redirect(request.url)
+            app.logger.error("No se encontró 'pdf_file' en la solicitud.")
+            return "No se envió ningún archivo PDF.", 400
         
         file = request.files['pdf_file']
         specific_codes_str = request.form.get('specific_codes', '')
 
         if file.filename == '' or not specific_codes_str.strip():
-            flash('Es necesario seleccionar un archivo PDF y proporcionar al menos un código.', 'error')
-            return redirect(request.url)
+            app.logger.error("Falta el archivo PDF o los códigos.")
+            return "Falta el archivo PDF o los códigos.", 400
 
         if file and file.filename.lower().endswith('.pdf'):
             try:
-                # Procesar la lista de códigos, eliminando vacíos y duplicados
                 codes_to_find = set(filter(None, re.split(r'[\s,;\n]+', specific_codes_str.strip())))
-                
-                # Cargar el PDF desde los bytes recibidos
+                app.logger.info(f"Códigos recibidos para buscar: {list(codes_to_find)}")
+
                 pdf_bytes = file.read()
                 doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                app.logger.info(f"PDF '{file.filename}' abierto con {len(doc)} páginas.")
                 
                 pages_found = set()
 
-                # Recorrer cada página del documento
                 for page_num in range(len(doc)):
+                    app.logger.info(f"Procesando página {page_num + 1}...")
                     page = doc.load_page(page_num)
-                    # Usar la nueva función de resaltado mejorada
                     if highlight_codes_on_page(page, codes_to_find):
                         pages_found.add(page_num + 1)
                 
-                # Guardar el PDF modificado en memoria para enviarlo como respuesta
                 output_pdf_bytes = doc.tobytes()
                 doc.close()
+                app.logger.info(f"Proceso finalizado. Páginas con coincidencias: {sorted(list(pages_found))}")
 
-                # Preparar la respuesta que se enviará de vuelta al navegador
                 response = make_response(output_pdf_bytes)
                 response.headers.set('Content-Type', 'application/pdf')
                 response.headers.set('Content-Disposition', 'inline', filename='resaltado.pdf')
-                # Enviar la lista de páginas encontradas en una cabecera personalizada
                 response.headers.set('X-Pages-Found', json.dumps(sorted(list(pages_found))))
                 
                 return response
 
             except Exception as e:
-                # Capturar cualquier error inesperado durante el procesamiento
-                flash(f'Ocurrió un error al procesar el PDF: {e}', 'error')
-                app.logger.error(f"Error procesando PDF: {e}")
-                return redirect(request.url)
+                app.logger.error(f"EXCEPCIÓN INESPERADA: {e}", exc_info=True)
+                return f"Ocurrió un error interno: {e}", 500
         else:
-            flash('Formato de archivo no válido. Por favor, sube un PDF.', 'error')
-            return redirect(request.url)
+            return "Formato de archivo no válido.", 400
 
-    # Si la solicitud es GET, simplemente mostrar el formulario de subida
     return render_template('index.html')
 
 if __name__ == '__main__':
-    # Configuración para que funcione tanto localmente como en Railway
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
