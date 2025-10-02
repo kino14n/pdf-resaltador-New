@@ -4,9 +4,6 @@ from flask import Flask, request, make_response, render_template
 import os
 import json
 import logging
-import pytesseract
-from PIL import Image
-import io
 
 # Configuración de logging para que se vea en Railway
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -16,10 +13,9 @@ app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
 
 def highlight_codes_on_page(page, codes_to_find):
     """
-    Busca y resalta códigos en una página usando tres estrategias:
+    Busca y resalta códigos en una página usando dos estrategias de texto:
     1. Búsqueda de texto normal.
-    2. Búsqueda de texto con espaciado.
-    3. Búsqueda con OCR como último recurso.
+    2. Búsqueda de texto con espaciado (para PDFs con formato especial).
     """
     found_on_page = False
     
@@ -38,45 +34,15 @@ def highlight_codes_on_page(page, codes_to_find):
     # --- ESTRATEGIA 2: BÚSQUEDA DE TEXTO CON ESPACIADO ---
     app.logger.info(f"Página {page.number + 1}: Estrategia 1 falló. Iniciando Estrategia 2 (Búsqueda con Espaciado).")
     for code in codes_to_find:
-        # Crear una versión del código con espacios (ej: "C-O-D-E")
-        spaced_out_code = " ".join(code)
+        # Crear una versión del código con espacios (ej: "C O D I G O")
+        spaced_out_code = " ".join(list(code))
         instances = page.search_for(spaced_out_code, flags=re.IGNORECASE)
         if instances:
             found_on_page = True
             for inst in instances:
                 page.add_highlight_annot(inst)
             app.logger.info(f"ÉXITO (Espaciado): Código '{code}' encontrado en la página {page.number + 1}.")
-    if found_on_page:
-        return True
-
-    # --- ESTRATEGIA 3: RESPALDO CON OCR ---
-    app.logger.warning(f"Página {page.number + 1}: Estrategias 1 y 2 fallaron. Iniciando Estrategia 3 (OCR).")
-    try:
-        pix = page.get_pixmap(dpi=200)
-        img_bytes = pix.tobytes("png")
-        img = Image.open(io.BytesIO(img_bytes))
-        ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, lang='spa')
-        
-        n_boxes = len(ocr_data['level'])
-        codes_to_find_lower = {c.lower() for c in codes_to_find}
-        for i in range(n_boxes):
-            word_text = ocr_data['text'][i].strip()
-            # Limpiar la palabra leída por el OCR
-            cleaned_word = re.sub(r'[^a-zA-Z0-9-]', '', word_text)
-            
-            if cleaned_word and cleaned_word.lower() in codes_to_find_lower:
-                found_on_page = True
-                app.logger.info(f"ÉXITO (OCR): Código '{cleaned_word}' encontrado en la página {page.number + 1}.")
-                (x, y, w, h) = (ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i])
-                
-                zoom_x = pix.width / page.rect.width
-                zoom_y = pix.height / page.rect.height
-                
-                rect = fitz.Rect(x / zoom_x, y / zoom_y, (x + w) / zoom_x, (y + h) / zoom_y)
-                page.add_highlight_annot(rect)
-    except Exception as e:
-        app.logger.error(f"Error durante el proceso de OCR en la página {page.number + 1}: {e}")
-
+    
     return found_on_page
 
 @app.route('/', methods=['GET', 'POST'])
