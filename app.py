@@ -1,140 +1,283 @@
-import fitz  # PyMuPDF
-import re
-from flask import Flask, request, make_response, render_template
-import os
-import json
-import logging
-import pytesseract
-from PIL import Image
-import io
 
-# Configuración de logging para que se vea en Railway
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+<?php 
+// api.php
 
-app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
+// Manejo de solicitud OPTIONS para CORS
+if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
+    header("Access-Control-Allow-Origin: *");
+    header("Access-Control-Allow-Methods: POST, GET, OPTIONS");
+    header("Access-Control-Allow-Headers: Content-Type, Authorization");
+    http_response_code(200);
+    exit();
+}
 
-def highlight_codes_on_page(page, codes_to_find):
-    """
-    Busca y resalta códigos en una página.
-    Primero intenta leer el texto palabra por palabra y limpiarlo.
-    Si eso falla, usa OCR como respaldo.
-    """
-    found_on_page = False
+ini_set('display_errors', 1);
+error_reporting(E_ALL);
+
+require_once __DIR__ . '/config.php';
+
+header('Content-Type: application/json');
+$dsn = "mysql:host=" . DB_HOST . ";port=" . DB_PORT . ";dbname=" . DB_NAME . ";charset=utf8mb4";
+try {
+    $db = new PDO($dsn, DB_USER, DB_PASS, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+    ]);
+} catch (PDOException $e) {
+    http_response_code(500);
+    echo json_encode(['error' => 'Error de conexión: '.$e->getMessage()]);
+    exit;
+}
+
+$action = $_REQUEST['action'] ?? '';
+
+switch ($action) {
+
+  case 'get_config':
+    echo json_encode([
+      'headerTitle' => APP_HEADER_TITLE,
+      'logoPath'    => APP_LOGO_PATH
+    ]);
+    break;
+  
+  case 'get_public_config':
+    echo json_encode([
+      'headerTitle' => PUBLIC_HEADER_TITLE,
+      'logoPath'    => PUBLIC_LOGO_PATH
+    ]);
+    break;
+
+  case 'suggest':
+    $term = trim($_GET['term'] ?? '');
+    if ($term === '') { echo json_encode([]); exit; }
+    $stmt = $db->prepare("SELECT DISTINCT code FROM codes WHERE code LIKE ? ORDER BY code ASC LIMIT 10");
+    $stmt->execute([$term . '%']);
+    echo json_encode($stmt->fetchAll(PDO::FETCH_COLUMN));
+    break;
+
+  case 'upload':
+    $name  = $_POST['name'] ?? '';
+    $date  = $_POST['date'] ?? '';
+    $codes = array_filter(array_map('trim', preg_split('/\\r?\\n/', $_POST['codes'] ?? '')));
+    $file  = $_FILES['file'] ?? null;
+    if (!$name || !$date || !$file || $file['error'] !== UPLOAD_ERR_OK) { http_response_code(400); echo json_encode(['error'=>'Faltan datos o hubo un error al subir el archivo.']); exit; }
+    $filename = time().'_'.preg_replace("/[^a-zA-Z0-9\._-]/", "_", basename($file['name']));
+    if (!move_uploaded_file($file['tmp_name'], __DIR__.'/uploads/'.$filename)) { http_response_code(500); echo json_encode(['error'=>'No se pudo guardar el archivo.']); exit; }
+    $db->prepare('INSERT INTO documents (name,date,path) VALUES (?,?,?)')->execute([$name,$date,$filename]);
+    $docId = $db->lastInsertId();
+    $ins = $db->prepare('INSERT INTO codes (document_id,code) VALUES (?,?)');
+    foreach (array_unique($codes) as $c) { $ins->execute([$docId,$c]); }
+    echo json_encode(['message'=>'Documento guardado.']);
+    break;
+
+  case 'list':
+    $stmt = $db->query("SELECT d.id,d.name,d.date,d.path, GROUP_CONCAT(c.code SEPARATOR '\\n') AS codes FROM documents d LEFT JOIN codes c ON d.id=c.document_id GROUP BY d.id ORDER BY d.date DESC");
+    $rows = $stmt->fetchAll();
+    $docs = array_map(function($r){ return ['id'=>(int)$r['id'], 'name'=>$r['name'], 'date'=>$r['date'], 'path'=>$r['path'], 'codes'=>$r['codes'] ? explode("\\n",$r['codes']) : []]; }, $rows);
+    echo json_encode(['data'=>$docs]);
+    break;
+
+  case 'search':
+    $codes_to_find = array_filter(array_unique(array_map('trim', preg_split('/[\\r\\n,]+/', $_POST['codes'] ?? ''))));
+    if (empty($codes_to_find)) {
+        echo json_encode([]);
+        exit;
+    }
+
+    $placeholders = implode(',', array_fill(0, count($codes_to_find), '?'));
+    $stmt = $db->prepare("
+        SELECT d.id, d.name, d.date, d.path, GROUP_CONCAT(c.code SEPARATOR '|') AS codes
+        FROM documents d
+        JOIN codes c ON d.id = c.document_id
+        WHERE c.code IN ($placeholders)
+        GROUP BY d.id, d.name, d.date, d.path
+        ORDER BY d.date DESC
+    ");
+    $stmt->execute($codes_to_find);
+    $all_docs_raw = $stmt->fetchAll();
+
+    $candidate_docs = [];
+    foreach ($all_docs_raw as $doc) {
+        $candidate_docs[$doc['id']] = [
+            'id' => (int)$doc['id'],
+            'name' => $doc['name'],
+            'date' => $doc['date'],
+            'path' => $doc['path'],
+            'codes' => $doc['codes'] ? explode('|', $doc['codes']) : []
+        ];
+    }
+
+    $remaining_codes = array_flip($codes_to_find);
+    $selected_docs = [];
+
+    while (!empty($remaining_codes) && !empty($candidate_docs)) {
+        $best_doc_id = -1;
+        $max_covered_count = -1;
+        
+        foreach ($candidate_docs as $doc_id => $doc) {
+            $covered_codes = array_intersect_key(array_flip($doc['codes']), $remaining_codes);
+            $covered_count = count($covered_codes);
+
+            if ($covered_count > $max_covered_count) {
+                $max_covered_count = $covered_count;
+                $best_doc_id = $doc_id;
+            }
+        }
+        
+        if ($best_doc_id === -1 || $max_covered_count === 0) {
+            break;
+        }
+
+        $best_doc = $candidate_docs[$best_doc_id];
+        $selected_docs[$best_doc_id] = $best_doc;
+
+        foreach ($best_doc['codes'] as $code) {
+            unset($remaining_codes[$code]);
+        }
+        
+        unset($candidate_docs[$best_doc_id]);
+    }
     
-    # --- ESTRATEGIA 1: BÚSQUEDA DE TEXTO INTELIGENTE ---
-    app.logger.info(f"Iniciando búsqueda de texto inteligente en la página {page.number + 1}.")
+    echo json_encode(array_values($selected_docs));
+    break;
+
+  case 'download_pdfs':
+    $uploadsDir = __DIR__ . '/uploads';
+    if (!is_dir($uploadsDir)) { http_response_code(500); echo json_encode(['error'=>'Carpeta uploads no encontrada']); exit; }
+    $zip = new ZipArchive();
+    $zipFileName = 'documentos_'.date('Ymd_His').'.zip';
+    $zipFilePath = sys_get_temp_dir() . '/' . $zipFileName;
+    if ($zip->open($zipFilePath, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== TRUE) { http_response_code(500); echo json_encode(['error'=>'No se pudo crear el ZIP.']); exit; }
+    $files = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($uploadsDir, RecursiveDirectoryIterator::SKIP_DOTS), RecursiveIteratorIterator::LEAVES_ONLY);
+    foreach ($files as $file) {
+        if (!$file->isDir()) {
+            $filePath = $file->getRealPath();
+            $relativePath = substr($filePath, strlen($uploadsDir) + 1);
+            $zip->addFile($filePath, $relativePath);
+        }
+    }
+    $zip->close();
+    header('Content-Type: application/zip');
+    header('Content-Disposition: attachment; filename="' . basename($zipFileName) . '"');
+    header('Content-Length: ' . filesize($zipFilePath));
+    readfile($zipFilePath);
+    unlink($zipFilePath);
+    exit;
+
+  case 'edit':
+    $id = (int)($_POST['id'] ?? 0);
+    $name = $_POST['name'] ?? '';
+    $date = $_POST['date'] ?? '';
+    if (!$id || !$name || !$date) { http_response_code(400); echo json_encode(['error'=>'Faltan datos.']); exit; }
+    $codes = array_filter(array_map('trim', preg_split('/\\r?\\n/', $_POST['codes'] ?? '')));
+    if (!empty($_FILES['file']['tmp_name'])) {
+      $old = $db->prepare('SELECT path FROM documents WHERE id=?');
+      $old->execute([$id]);
+      if ($path = $old->fetchColumn()) { @unlink(__DIR__.'/uploads/'.$path); }
+      $fn = time().'_'.preg_replace("/[^a-zA-Z0-9\._-]/", "_", basename($_FILES['file']['name']));
+      move_uploaded_file($_FILES['file']['tmp_name'], __DIR__.'/uploads/'.$fn);
+      $db->prepare('UPDATE documents SET name=?,date=?,path=? WHERE id=?')->execute([$name,$date,$fn,$id]);
+    } else {
+      $db->prepare('UPDATE documents SET name=?,date=? WHERE id=?')->execute([$name,$date,$id]);
+    }
+    $db->prepare('DELETE FROM codes WHERE document_id=?')->execute([$id]);
+    $ins = $db->prepare('INSERT INTO codes (document_id,code) VALUES (?,?)');
+    foreach (array_unique($codes) as $c) { $ins->execute([$id,$c]); }
+    echo json_encode(['message'=>'Documento actualizado.']);
+    break;
+
+  case 'delete':
+    $id = (int)($_GET['id'] ?? 0);
+    if (!$id) { http_response_code(400); echo json_encode(['error'=>'ID no válido.']); exit; }
+    $old = $db->prepare('SELECT path FROM documents WHERE id=?');
+    $old->execute([$id]);
+    if ($pathToDelete = $old->fetchColumn()) { @unlink(__DIR__.'/uploads/'.$pathToDelete); }
+    $db->prepare('DELETE FROM codes WHERE document_id=?')->execute([$id]);
+    $db->prepare('DELETE FROM documents WHERE id=?')->execute([$id]);
+    echo json_encode(['message'=>'Documento eliminado.']);
+    break;
+
+  case 'search_by_code':
+    $code = trim($_POST['code'] ?? '');
+    if (!$code) { echo json_encode([]); exit; }
+    $stmt = $db->prepare("SELECT d.id, d.name, d.date, d.path, GROUP_CONCAT(c2.code SEPARATOR '\\n') AS codes FROM documents d JOIN codes c1 ON d.id = c1.document_id LEFT JOIN codes c2 ON d.id = c2.document_id WHERE c1.code = ? GROUP BY d.id");
+    $stmt->execute([$code]);
+    $rows = $stmt->fetchAll();
+    $docs = array_map(function($r){ return ['id'=>(int)$r['id'], 'name'=>$r['name'], 'date'=>$r['date'], 'path'=>$r['path'], 'codes'=>$r['codes'] ? explode("\\n", $r['codes']) : []]; }, $rows);
+    echo json_encode($docs);
+    break;
+
+  case 'highlight_pdf':
+    header_remove('Content-Type');
+    $docId = (int)($_POST['id'] ?? 0);
+    $codesToHighlight = array_filter(array_map('trim', explode(',', $_POST['codes'] ?? '')));
+    if (!$docId || empty($codesToHighlight)) { 
+        http_response_code(400); 
+        echo json_encode(['error' => 'Faltan parámetros.']); 
+        exit; 
+    }
     
-    words = page.get_text("words")
-    codes_to_find_lower = {c.lower() for c in codes_to_find}
+    $stmt = $db->prepare('SELECT path FROM documents WHERE id = ?');
+    $stmt->execute([$docId]);
+    $path = $stmt->fetchColumn();
 
-    for word_tuple in words:
-        # La tupla es (x0, y0, x1, y1, "texto", ...)
-        word_text_original = word_tuple[4]
-        
-        # Limpiar la palabra extraída eliminando todos los espacios y caracteres no alfanuméricos (excepto guiones)
-        cleaned_word = re.sub(r'[^a-zA-Z0-9-]', '', word_text_original)
-        
-        if cleaned_word and cleaned_word.lower() in codes_to_find_lower:
-            found_on_page = True
-            rect = fitz.Rect(word_tuple[0], word_tuple[1], word_tuple[2], word_tuple[3])
-            page.add_highlight_annot(rect)
-            app.logger.info(f"¡COINCIDENCIA DE TEXTO! Código '{cleaned_word}' encontrado en la página {page.number + 1}.")
-            
-    if found_on_page:
-        return True
+    $full_path_to_check = __DIR__ . '/uploads/' . $path;
+    if (!$path || !file_exists($full_path_to_check)) {
+        http_response_code(404);
+        echo json_encode([
+            'error' => 'Archivo no encontrado en el servidor.',
+            'debug_info' => 'PHP no pudo encontrar el archivo en la ruta: ' . $full_path_to_check
+        ]);
+        exit;
+    }
+    
+    $pdfFilePath = $full_path_to_check;
 
-    # --- ESTRATEGIA 2: RESPALDO CON OCR (para PDFs que son imágenes) ---
-    app.logger.warning(f"La búsqueda de texto normal falló. Intentando con OCR en la página {page.number + 1}.")
-    try:
-        pix = page.get_pixmap(dpi=200) # Usamos 200 DPI para un buen balance entre velocidad y precisión
-        img_bytes = pix.tobytes("png")
-        img = Image.open(io.BytesIO(img_bytes))
-        
-        ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, lang='spa') # 'spa' para español
-        
-        n_boxes = len(ocr_data['level'])
-        for i in range(n_boxes):
-            word_text = ocr_data['text'][i].strip()
-            cleaned_word = re.sub(r'[^a-zA-Z0-9-]', '', word_text)
-            
-            if cleaned_word and cleaned_word.lower() in codes_to_find_lower:
-                found_on_page = True
-                app.logger.info(f"¡COINCIDENCIA CON OCR! Código '{cleaned_word}' encontrado.")
-                (x, y, w, h) = (ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i])
-                
-                # Convertir coordenadas de imagen a coordenadas de PDF
-                zoom_x = pix.width / page.rect.width
-                zoom_y = pix.height / page.rect.height
-                
-                rect = fitz.Rect(x / zoom_x, y / zoom_y, (x + w) / zoom_x, (y + h) / zoom_y)
-                page.add_highlight_annot(rect)
-                
-    except Exception as e:
-        app.logger.error(f"Error durante el proceso de OCR: {e}")
+    $ch = curl_init();
+    
+    $postData = [
+        'specific_codes' => implode("\n", $codesToHighlight), 
+        'pdf_file'       => new CURLFile($pdfFilePath, 'application/pdf', basename($pdfFilePath))
+    ];
 
-    return found_on_page
+    curl_setopt($ch, CURLOPT_URL, PDF_HIGHLIGHTER_URL);
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    
+    $responseHeaders = [];
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+    curl_setopt($ch, CURLOPT_HEADERFUNCTION, function($curl, $header) use (&$responseHeaders) {
+        $len = strlen($header);
+        $header = explode(':', $header, 2);
+        if (count($header) < 2) return $len;
+        $responseHeaders[strtolower(trim($header[0]))][] = trim($header[1]);
+        return $len;
+    });
+    
+    $highlightedPdf = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $error = curl_error($ch);
+    curl_close($ch);
 
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    if request.method == 'POST':
-        app.logger.info("="*50)
-        app.logger.info("Nueva solicitud POST recibida.")
+    if ($httpCode === 200 && $highlightedPdf) {
+        header('Content-Type: application/pdf');
+        header('Content-Disposition: attachment; filename="resaltado_' . basename($pdfFilePath) . '"');
+        if (isset($responseHeaders['x-pages-found'])) {
+            header('X-Pages-Found: ' . $responseHeaders['x-pages-found'][0]);
+            header('Access-Control-Expose-Headers: X-Pages-Found');
+        }
+        echo $highlightedPdf;
+    } else {
+        http_response_code(500);
+        header('Content-Type: application/json');
+        echo json_encode(['error' => 'El servicio de resaltado falló.', 'details' => $error ? 'cURL error: ' . $error : 'HTTP status: ' . $httpCode]);
+    }
+    exit;
 
-        if 'pdf_file' not in request.files or 'specific_codes' not in request.form:
-             app.logger.error("Solicitud inválida: Faltan 'pdf_file' o 'specific_codes'.")
-             return "Faltan datos", 400
-        
-        file = request.files['pdf_file']
-        specific_codes_str = request.form.get('specific_codes', '')
-
-        if file.filename == '' or not specific_codes_str.strip():
-            app.logger.error("Archivo PDF o códigos no proporcionados.")
-            return "Archivo o códigos no proporcionados", 400
-
-        try:
-            codes_to_find = set(filter(None, re.split(r'[\s,;\n]+', specific_codes_str.strip())))
-            app.logger.info(f"Buscando los siguientes códigos: {list(codes_to_find)}")
-
-            pdf_bytes = file.read()
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            app.logger.info(f"PDF '{file.filename}' abierto con {len(doc)} páginas.")
-            
-            pages_with_highlights_indices = []
-
-            for page_num in range(len(doc)):
-                page = doc.load_page(page_num)
-                if highlight_codes_on_page(page, codes_to_find):
-                    pages_with_highlights_indices.append(page_num)
-            
-            if pages_with_highlights_indices:
-                app.logger.info(f"Coincidencias encontradas en las páginas (índice 0): {pages_with_highlights_indices}. Creando PDF nuevo.")
-                new_doc = fitz.open()
-                new_doc.insert_pdf(doc, from_page=pages_with_highlights_indices[0], to_pages=pages_with_highlights_indices)
-                output_pdf_bytes = new_doc.tobytes(garbage=4, deflate=True, clean=True)
-                new_doc.close()
-            else:
-                app.logger.info("No se encontraron coincidencias. Devolviendo el PDF original.")
-                output_pdf_bytes = doc.tobytes()
-
-            doc.close()
-            
-            pages_found_user_friendly = [p + 1 for p in pages_with_highlights_indices]
-            app.logger.info(f"Proceso finalizado. Páginas con coincidencias: {pages_found_user_friendly}")
-
-            response = make_response(output_pdf_bytes)
-            response.headers.set('Content-Type', 'application/pdf')
-            response.headers.set('Content-Disposition', 'inline', filename='resultado.pdf')
-            response.headers.set('X-Pages-Found', json.dumps(sorted(pages_found_user_friendly)))
-            
-            return response
-
-        except Exception as e:
-            app.logger.error(f"EXCEPCIÓN INESPERADA: {e}", exc_info=True)
-            return f"Error interno: {e}", 500
-
-    return render_template('index.html')
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+  default:
+    http_response_code(400);
+    echo json_encode(['error'=>'Acción inválida.']);
+    break;
+}
