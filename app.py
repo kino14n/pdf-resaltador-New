@@ -18,28 +18,25 @@ def check_tesseract():
     """Verifica si Tesseract y el idioma español están disponibles."""
     try:
         pytesseract.get_tesseract_version()
-        languages = pytesseract.get_languages()
-        if 'spa' in languages:
-            app.logger.info("Tesseract y el paquete de idioma español ('spa') están instalados correctamente.")
+        if 'spa' in pytesseract.get_languages():
+            app.logger.info("Tesseract y 'spa' están listos.")
             return True
         else:
-            app.logger.warning("Tesseract está instalado, pero falta el paquete de idioma español ('spa'). El OCR no funcionará para español.")
+            app.logger.warning("Tesseract OK, pero falta el paquete de idioma 'spa'. OCR no funcionará.")
             return False
     except pytesseract.TesseractNotFoundError:
-        app.logger.error("El ejecutable de Tesseract no se encontró. El OCR está deshabilitado.")
+        app.logger.error("Tesseract no encontrado. El OCR está deshabilitado.")
         return False
 
-# Verificar Tesseract una sola vez al iniciar la aplicación
 TESSERACT_AVAILABLE = check_tesseract()
 
 def highlight_codes_on_page(page, codes_to_find):
     """
-    Busca y resalta códigos usando múltiples estrategias de texto.
-    Solo usa OCR si está disponible.
+    Busca y resalta códigos en una página usando tres estrategias.
     """
     found_on_page = False
     
-    # Estrategia 1: Búsqueda de texto normal (rápida)
+    # --- ESTRATEGIA 1: BÚSQUEDA DE TEXTO NORMAL (Rápida) ---
     app.logger.info(f"Página {page.number + 1}: Ejecutando Estrategia 1 (Búsqueda Normal).")
     for code in codes_to_find:
         instances = page.search_for(code, flags=re.IGNORECASE)
@@ -51,7 +48,7 @@ def highlight_codes_on_page(page, codes_to_find):
         app.logger.info(f"ÉXITO (Normal) en página {page.number + 1}.")
         return True
 
-    # Estrategia 2: Búsqueda de texto con espaciado (para PDFs con formato especial)
+    # --- ESTRATEGIA 2: BÚSQUEDA DE TEXTO CON ESPACIADO (Para tus PDFs) ---
     app.logger.info(f"Página {page.number + 1}: Ejecutando Estrategia 2 (Búsqueda con Espaciado).")
     for code in codes_to_find:
         spaced_out_code = " ".join(list(code))
@@ -64,9 +61,9 @@ def highlight_codes_on_page(page, codes_to_find):
         app.logger.info(f"ÉXITO (Espaciado) en página {page.number + 1}.")
         return True
 
-    # Estrategia 3: Respaldo con OCR (solo si Tesseract está disponible)
+    # --- ESTRATEGIA 3: RESPALDO CON OCR (Solo si las otras fallan y está disponible) ---
     if TESSERACT_AVAILABLE:
-        app.logger.warning(f"Búsquedas de texto fallaron. Intentando con OCR en la página {page.number + 1}.")
+        app.logger.warning(f"Página {page.number + 1}: Ejecutando Estrategia 3 (OCR).")
         try:
             pix = page.get_pixmap(dpi=200)
             img = Image.open(io.BytesIO(pix.tobytes("png")))
@@ -90,28 +87,34 @@ def highlight_codes_on_page(page, codes_to_find):
         except Exception as e:
             app.logger.error(f"Error durante el proceso de OCR: {e}")
     else:
-        app.logger.warning(f"OCR no disponible. Saltando estrategia de OCR para la página {page.number + 1}.")
+        app.logger.warning(f"OCR no disponible. Saltando Estrategia 3.")
 
     return found_on_page
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
     if request.method == 'POST':
+        app.logger.info("="*50)
+        app.logger.info("Nueva solicitud POST recibida.")
+
         if 'pdf_file' not in request.files or 'specific_codes' not in request.form:
              app.logger.error("Solicitud inválida: Faltan 'pdf_file' o 'specific_codes'.")
-             return "Solicitud inválida: Faltan 'pdf_file' o 'specific_codes'.", 400
+             return "Faltan datos", 400
         
         file = request.files['pdf_file']
         specific_codes_str = request.form.get('specific_codes', '')
 
         if file.filename == '' or not specific_codes_str.strip():
             app.logger.error("Archivo PDF o códigos no proporcionados.")
-            return "Archivo PDF o códigos no proporcionados.", 400
+            return "Archivo o códigos no proporcionados", 400
 
         try:
             codes_to_find = set(filter(None, re.split(r'[\s,;\n]+', specific_codes_str.strip())))
+            app.logger.info(f"Buscando los siguientes códigos: {list(codes_to_find)}")
+
             pdf_bytes = file.read()
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            
             pages_with_highlights_indices = []
 
             for page_num in range(len(doc)):
@@ -139,7 +142,7 @@ def index():
 
         except Exception as e:
             app.logger.error(f"EXCEPCIÓN INESPERADA: {e}", exc_info=True)
-            return f"Error interno del servidor: {e}", 500
+            return f"Error interno: {e}", 500
 
     return render_template('index.html')
 
