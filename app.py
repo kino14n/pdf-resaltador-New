@@ -1,148 +1,117 @@
 import fitz  # PyMuPDF
 import re
-from flask import Flask, request, make_response, render_template
+from flask import Flask, request, make_response, abort
 import os
 import json
-import logging
-import pytesseract
-from PIL import Image
 import io
-
-# Configuración de logging para que se vea en Railway
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
 
-# Color naranja para el resaltado (RGB en formato 0-1)
-HIGHLIGHT_COLOR = (1, 0.75, 0)
-
-def check_tesseract():
-    """Verifica si Tesseract y el idioma español están disponibles."""
-    try:
-        pytesseract.get_tesseract_version()
-        if 'spa' in pytesseract.get_languages():
-            app.logger.info("Tesseract y 'spa' están listos.")
-            return True
-        else:
-            app.logger.warning("Tesseract OK, pero falta el paquete de idioma 'spa'. OCR no funcionará.")
-            return False
-    except pytesseract.TesseractNotFoundError:
-        app.logger.error("Tesseract no encontrado. El OCR está deshabilitado.")
-        return False
-
-TESSERACT_AVAILABLE = check_tesseract()
-
-def highlight_codes_on_page(page, codes_to_find):
+def search_and_highlight(pdf_bytes: bytes, codes_to_find: set) -> (bytes, list):
     """
-    Busca y resalta códigos en una página usando múltiples estrategias.
+    Abre un PDF desde bytes, busca cada código en todas las páginas y devuelve
+    un nuevo PDF (en bytes) con SOLO las páginas que tuvieron coincidencias,
+    resaltando el texto en naranja. También devuelve una lista de las páginas encontradas.
     """
-    found_on_page = False
-    
-    # --- ESTRATEGIA 1: BÚSQUEDA DE TEXTO NORMAL ---
-    for code in codes_to_find:
-        instances = page.search_for(code, flags=re.IGNORECASE)
-        if instances:
-            found_on_page = True
-            for inst in instances:
-                highlight = page.add_highlight_annot(inst)
-                highlight.set_colors(stroke=HIGHLIGHT_COLOR) # Aplicar color naranja
-                highlight.update()
-    
-    # --- ESTRATEGIA 2: BÚSQUEDA DE TEXTO CON ESPACIADO ---
-    # Se ejecuta siempre para encontrar todas las coincidencias posibles
-    for code in codes_to_find:
-        spaced_out_code = " ".join(list(code))
-        instances = page.search_for(spaced_out_code, flags=re.IGNORECASE)
-        if instances:
-            found_on_page = True
-            for inst in instances:
-                highlight = page.add_highlight_annot(inst)
-                highlight.set_colors(stroke=HIGHLIGHT_COLOR) # Aplicar color naranja
-                highlight.update()
+    if not codes_to_find:
+        raise ValueError("La lista de códigos a buscar está vacía.")
 
-    # --- ESTRATEGIA 3: RESPALDO CON OCR (Solo si Tesseract está disponible) ---
-    if TESSERACT_AVAILABLE:
-        try:
-            pix = page.get_pixmap(dpi=200)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            ocr_data = pytesseract.image_to_data(img, lang='spa', output_type=pytesseract.Output.DICT)
+    src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    
+    pages_with_matches = []
+    highlight_color = (1, 0.75, 0) # Color Naranja
+
+    # Primer paso: Iterar y encontrar las páginas que tienen coincidencias
+    for page in src_doc:
+        found_on_page = False
+        for code in codes_to_find:
+            # Estrategia 1: Búsqueda normal (ignora mayúsculas/minúsculas)
+            if page.search_for(code, flags=re.IGNORECASE):
+                found_on_page = True
+                break # Si ya encontramos un código, pasamos a la siguiente página
             
-            n_boxes = len(ocr_data['level'])
-            codes_to_find_lower = {c.lower() for c in codes_to_find}
-            for i in range(n_boxes):
-                word_text = ocr_data['text'][i].strip()
-                cleaned_word = re.sub(r'[^a-zA-Z0-9-]', '', word_text)
-                
-                if cleaned_word and cleaned_word.lower() in codes_to_find_lower:
-                    found_on_page = True
-                    (x, y, w, h) = (ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i])
-                    zoom_x = pix.width / page.rect.width
-                    zoom_y = pix.height / page.rect.height
-                    rect = fitz.Rect(x / zoom_x, y / zoom_y, (x + w) / zoom_x, (y + h) / zoom_y)
-                    highlight = page.add_highlight_annot(rect)
-                    highlight.set_colors(stroke=HIGHLIGHT_COLOR) # Aplicar color naranja
-                    highlight.update()
-        except Exception as e:
-            app.logger.error(f"Error durante el proceso de OCR: {e}")
-    
-    return found_on_page
-
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    if request.method == 'POST':
-        app.logger.info("="*50)
-        app.logger.info("Nueva solicitud POST recibida.")
-
-        if 'pdf_file' not in request.files or 'specific_codes' not in request.form:
-             return "Solicitud inválida: Faltan 'pdf_file' o 'specific_codes'.", 400
+            # Estrategia 2: Búsqueda con espaciado (para tus PDFs especiales)
+            spaced_out_code = " ".join(list(code))
+            if page.search_for(spaced_out_code, flags=re.IGNORECASE):
+                found_on_page = True
+                break
         
-        file = request.files['pdf_file']
-        specific_codes_str = request.form.get('specific_codes', '')
+        if found_on_page:
+            pages_with_matches.append(page.number)
 
-        if file.filename == '' or not specific_codes_str.strip():
-            return "Archivo PDF o códigos no proporcionados.", 400
+    if not pages_with_matches:
+        src_doc.close()
+        return None, []
 
-        try:
-            codes_to_find = set(filter(None, re.split(r'[\s,;\n]+', specific_codes_str.strip())))
-            pdf_bytes = file.read()
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    # Segundo paso: Crear un nuevo PDF y añadir solo las páginas encontradas
+    new_doc = fitz.open()
+    new_doc.insert_pdf(src_doc, from_page=pages_with_matches[0], to_pages=pages_with_matches)
+
+    # Tercer paso: Aplicar el resaltado en el nuevo documento
+    for page in new_doc:
+        for code in codes_to_find:
+            # Búsqueda normal
+            instances = page.search_for(code, flags=re.IGNORECASE)
+            for inst in instances:
+                annot = page.add_highlight_annot(inst)
+                annot.set_colors(stroke=highlight_color)
+                annot.update()
             
-            pages_with_highlights_indices = []
+            # Búsqueda con espaciado
+            spaced_out_code = " ".join(list(code))
+            instances_spaced = page.search_for(spaced_out_code, flags=re.IGNORECASE)
+            for inst in instances_spaced:
+                annot = page.add_highlight_annot(inst)
+                annot.set_colors(stroke=highlight_color)
+                annot.update()
 
-            for page_num in range(len(doc)):
-                page = doc.load_page(page_num)
-                if highlight_codes_on_page(page, codes_to_find):
-                    pages_with_highlights_indices.append(page_num)
-            
-            # Si se encontraron coincidencias, crear un nuevo PDF solo con esas páginas
-            if pages_with_highlights_indices:
-                app.logger.info(f"Coincidencias encontradas. Creando PDF nuevo solo con páginas: {[p + 1 for p in pages_with_highlights_indices]}.")
-                new_doc = fitz.open()
-                # Usar la lista de índices para insertar las páginas correctas
-                new_doc.insert_pdf(doc, from_page=pages_with_highlights_indices[0], to_pages=pages_with_highlights_indices)
-                output_pdf_bytes = new_doc.tobytes(garbage=4, deflate=True, clean=True)
-                new_doc.close()
-            else:
-                # Si no se encontró nada, devolver el documento original
-                app.logger.info("No se encontraron coincidencias en ninguna página. Devolviendo el PDF original.")
-                output_pdf_bytes = doc.tobytes()
+    result_bytes = new_doc.tobytes(garbage=4, deflate=True)
+    src_doc.close()
+    new_doc.close()
+    
+    # Devolver el PDF en bytes y la lista de números de página (empezando en 1)
+    return result_bytes, [p + 1 for p in pages_with_matches]
 
-            doc.close()
-            
-            pages_found_user_friendly = [p + 1 for p in pages_with_highlights_indices]
-            response = make_response(output_pdf_bytes)
-            response.headers.set('Content-Type', 'application/pdf')
-            response.headers.set('Content-Disposition', 'inline', filename='resultado.pdf')
-            response.headers.set('X-Pages-Found', json.dumps(sorted(pages_found_user_friendly)))
-            
-            return response
+@app.route('/highlight', methods=['POST'])
+def highlight():
+    """
+    Endpoint para recibir el PDF y los códigos.
+    """
+    # 1. Validar la entrada
+    if 'pdf_file' not in request.files:
+        abort(400, "Parámetro 'pdf_file' (archivo) no encontrado.")
+    
+    file = request.files['pdf_file']
+    codes_str = request.form.get('codes', '')
 
-        except Exception as e:
-            app.logger.error(f"EXCEPCIÓN INESPERADA: {e}", exc_info=True)
-            return f"Error interno del servidor: {e}", 500
+    if file.filename == '' or not file.filename.lower().endswith('.pdf'):
+        abort(400, "Es necesario un archivo con extensión .pdf.")
+    if not codes_str.strip():
+        abort(400, "Parámetro 'codes' (códigos a buscar) no encontrado o vacío.")
 
-    return render_template('index.html')
+    try:
+        # 2. Preparar los datos
+        codes_to_find = set(filter(None, re.split(r'[\s,;\n]+', codes_str.strip())))
+        pdf_bytes = file.read()
+
+        # 3. Llamar a la función principal
+        out_bytes, pages_found = search_and_highlight(pdf_bytes, codes_to_find)
+
+        # 4. Manejar el resultado
+        if not out_bytes:
+            abort(404, f"No se encontraron los códigos en el documento.")
+
+        response = make_response(out_bytes)
+        response.headers.set('Content-Type', 'application/pdf')
+        response.headers.set('Content-Disposition', 'inline', filename='resultado.pdf')
+        response.headers.set('X-Pages-Found', json.dumps(sorted(pages_found)))
+        
+        return response
+
+    except Exception as e:
+        app.logger.error(f"EXCEPCIÓN INESPERADA: {e}", exc_info=True)
+        abort(500, f"Error interno del servidor: {e}")
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
