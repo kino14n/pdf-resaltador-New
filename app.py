@@ -15,29 +15,34 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
 
 def check_tesseract():
-    """Verifica si Tesseract y el idioma español están disponibles."""
+    """Verifica si Tesseract está instalado y es ejecutable."""
     try:
         pytesseract.get_tesseract_version()
-        if 'spa' in pytesseract.get_languages():
-            app.logger.info("Tesseract y 'spa' están listos.")
+        languages = pytesseract.get_languages()
+        app.logger.info(f"Tesseract encontrado. Idiomas disponibles: {languages}")
+        if 'spa' in languages:
+            app.logger.info("El paquete de idioma español ('spa') está instalado.")
             return True
         else:
-            app.logger.warning("Tesseract OK, pero falta el paquete de idioma 'spa'. OCR no funcionará.")
+            app.logger.warning("ADVERTENCIA: Tesseract está instalado, pero falta el paquete de idioma español ('spa').")
             return False
     except pytesseract.TesseractNotFoundError:
-        app.logger.error("Tesseract no encontrado. El OCR está deshabilitado.")
+        app.logger.error("ERROR CRÍTICO: El ejecutable de Tesseract no se encontró. El OCR estará deshabilitado.")
+        return False
+    except Exception as e:
+        app.logger.error(f"Error inesperado al verificar Tesseract: {e}")
         return False
 
+# Verificar Tesseract una sola vez al iniciar la aplicación
 TESSERACT_AVAILABLE = check_tesseract()
 
 def highlight_codes_on_page(page, codes_to_find):
     """
-    Busca y resalta códigos en una página usando tres estrategias.
+    Busca y resalta códigos usando múltiples estrategias.
     """
     found_on_page = False
     
-    # --- ESTRATEGIA 1: BÚSQUEDA DE TEXTO NORMAL (Rápida) ---
-    app.logger.info(f"Página {page.number + 1}: Ejecutando Estrategia 1 (Búsqueda Normal).")
+    # Estrategia 1: Búsqueda de texto normal (rápida)
     for code in codes_to_find:
         instances = page.search_for(code, flags=re.IGNORECASE)
         if instances:
@@ -45,11 +50,10 @@ def highlight_codes_on_page(page, codes_to_find):
             for inst in instances:
                 page.add_highlight_annot(inst)
     if found_on_page:
-        app.logger.info(f"ÉXITO (Normal) en página {page.number + 1}.")
+        app.logger.info(f"ÉXITO (Estrategia 1 - Normal) en página {page.number + 1}.")
         return True
 
-    # --- ESTRATEGIA 2: BÚSQUEDA DE TEXTO CON ESPACIADO (Para tus PDFs) ---
-    app.logger.info(f"Página {page.number + 1}: Ejecutando Estrategia 2 (Búsqueda con Espaciado).")
+    # Estrategia 2: Búsqueda de texto con espaciado
     for code in codes_to_find:
         spaced_out_code = " ".join(list(code))
         instances = page.search_for(spaced_out_code, flags=re.IGNORECASE)
@@ -58,12 +62,12 @@ def highlight_codes_on_page(page, codes_to_find):
             for inst in instances:
                 page.add_highlight_annot(inst)
     if found_on_page:
-        app.logger.info(f"ÉXITO (Espaciado) en página {page.number + 1}.")
+        app.logger.info(f"ÉXITO (Estrategia 2 - Espaciado) en página {page.number + 1}.")
         return True
 
-    # --- ESTRATEGIA 3: RESPALDO CON OCR (Solo si las otras fallan y está disponible) ---
+    # Estrategia 3: Respaldo con OCR (solo si Tesseract está bien configurado)
     if TESSERACT_AVAILABLE:
-        app.logger.warning(f"Página {page.number + 1}: Ejecutando Estrategia 3 (OCR).")
+        app.logger.warning(f"Estrategias de texto fallaron. Ejecutando Estrategia 3 (OCR) en la página {page.number + 1}.")
         try:
             pix = page.get_pixmap(dpi=200)
             img = Image.open(io.BytesIO(pix.tobytes("png")))
@@ -87,34 +91,26 @@ def highlight_codes_on_page(page, codes_to_find):
         except Exception as e:
             app.logger.error(f"Error durante el proceso de OCR: {e}")
     else:
-        app.logger.warning(f"OCR no disponible. Saltando Estrategia 3.")
+        app.logger.warning(f"OCR no disponible o mal configurado. Saltando Estrategia 3.")
 
     return found_on_page
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
     if request.method == 'POST':
-        app.logger.info("="*50)
-        app.logger.info("Nueva solicitud POST recibida.")
-
         if 'pdf_file' not in request.files or 'specific_codes' not in request.form:
-             app.logger.error("Solicitud inválida: Faltan 'pdf_file' o 'specific_codes'.")
-             return "Faltan datos", 400
+             return "Solicitud inválida: Faltan 'pdf_file' o 'specific_codes'.", 400
         
         file = request.files['pdf_file']
         specific_codes_str = request.form.get('specific_codes', '')
 
         if file.filename == '' or not specific_codes_str.strip():
-            app.logger.error("Archivo PDF o códigos no proporcionados.")
-            return "Archivo o códigos no proporcionados", 400
+            return "Archivo PDF o códigos no proporcionados.", 400
 
         try:
             codes_to_find = set(filter(None, re.split(r'[\s,;\n]+', specific_codes_str.strip())))
-            app.logger.info(f"Buscando los siguientes códigos: {list(codes_to_find)}")
-
             pdf_bytes = file.read()
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            
             pages_with_highlights_indices = []
 
             for page_num in range(len(doc)):
@@ -124,7 +120,7 @@ def index():
             
             if pages_with_highlights_indices:
                 new_doc = fitz.open()
-                new_doc.insert_pdf(doc, from_page=pages_with_highlights_indices[0], to_pages=pages_with_highlights_indices)
+                new_doc.insert_pdf(doc, from_page_p=pages_with_highlights_indices)
                 output_pdf_bytes = new_doc.tobytes(garbage=4, deflate=True, clean=True)
                 new_doc.close()
             else:
@@ -139,10 +135,9 @@ def index():
             response.headers.set('X-Pages-Found', json.dumps(sorted(pages_found_user_friendly)))
             
             return response
-
         except Exception as e:
             app.logger.error(f"EXCEPCIÓN INESPERADA: {e}", exc_info=True)
-            return f"Error interno: {e}", 500
+            return f"Error interno del servidor: {e}", 500
 
     return render_template('index.html')
 
