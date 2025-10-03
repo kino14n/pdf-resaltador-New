@@ -4,9 +4,6 @@ from flask import Flask, request, make_response, render_template
 import os
 import json
 import logging
-import pytesseract
-from PIL import Image
-import io
 
 # Configuración de logging para que se vea en Railway
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -14,97 +11,70 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
 
-def check_tesseract():
-    """Verifica si Tesseract está instalado y es ejecutable."""
-    try:
-        pytesseract.get_tesseract_version()
-        languages = pytesseract.get_languages()
-        app.logger.info(f"Tesseract encontrado. Idiomas disponibles: {languages}")
-        if 'spa' in languages:
-            app.logger.info("El paquete de idioma español ('spa') está instalado.")
-            return True
-        else:
-            app.logger.warning("ADVERTENCIA: Tesseract está instalado, pero falta el paquete de idioma español ('spa').")
-            return False
-    except pytesseract.TesseractNotFoundError:
-        app.logger.error("ERROR CRÍTICO: El ejecutable de Tesseract no se encontró. El OCR estará deshabilitado.")
-        return False
-    except Exception as e:
-        app.logger.error(f"Error inesperado al verificar Tesseract: {e}")
-        return False
-
-# Verificar Tesseract una sola vez al iniciar la aplicación
-TESSERACT_AVAILABLE = check_tesseract()
-
 def highlight_codes_on_page(page, codes_to_find):
     """
-    Busca y resalta códigos usando múltiples estrategias.
+    Busca y resalta códigos usando una estrategia de texto limpio y robusto.
     """
     found_on_page = False
     
-    # Estrategia 1: Búsqueda de texto normal (rápida)
-    for code in codes_to_find:
-        instances = page.search_for(code, flags=re.IGNORECASE)
-        if instances:
-            found_on_page = True
-            for inst in instances:
-                page.add_highlight_annot(inst)
-    if found_on_page:
-        app.logger.info(f"ÉXITO (Estrategia 1 - Normal) en página {page.number + 1}.")
-        return True
+    # Obtener el texto completo de la página una sola vez
+    page_text = page.get_text("text")
+    if not page_text.strip():
+        app.logger.info(f"Página {page.number + 1} no contiene texto extraíble.")
+        return False
+        
+    # Crear una versión "limpia" del texto de la página: sin espacios y en minúsculas
+    cleaned_page_text = re.sub(r'\s+', '', page_text).lower()
 
-    # Estrategia 2: Búsqueda de texto con espaciado
     for code in codes_to_find:
-        spaced_out_code = " ".join(list(code))
-        instances = page.search_for(spaced_out_code, flags=re.IGNORECASE)
-        if instances:
-            found_on_page = True
-            for inst in instances:
-                page.add_highlight_annot(inst)
-    if found_on_page:
-        app.logger.info(f"ÉXITO (Estrategia 2 - Espaciado) en página {page.number + 1}.")
-        return True
+        # Limpiar también el código a buscar
+        cleaned_code = re.sub(r'\s+', '', code).lower()
 
-    # Estrategia 3: Respaldo con OCR (solo si Tesseract está bien configurado)
-    if TESSERACT_AVAILABLE:
-        app.logger.warning(f"Estrategias de texto fallaron. Ejecutando Estrategia 3 (OCR) en la página {page.number + 1}.")
-        try:
-            pix = page.get_pixmap(dpi=200)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            ocr_data = pytesseract.image_to_data(img, lang='spa', output_type=pytesseract.Output.DICT)
+        # 1. VERIFICAR SI EXISTE: Comprobar si el código limpio está en el texto limpio.
+        if cleaned_code in cleaned_page_text:
+            app.logger.info(f"Coincidencia encontrada para '{code}' en la página {page.number + 1}. Buscando área para resaltar.")
             
-            n_boxes = len(ocr_data['level'])
-            codes_to_find_lower = {c.lower() for c in codes_to_find}
-            for i in range(n_boxes):
-                word_text = ocr_data['text'][i].strip()
-                cleaned_word = re.sub(r'[^a-zA-Z0-9-]', '', word_text)
-                
-                if cleaned_word and cleaned_word.lower() in codes_to_find_lower:
-                    found_on_page = True
-                    (x, y, w, h) = (ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i])
-                    zoom_x = pix.width / page.rect.width
-                    zoom_y = pix.height / page.rect.height
-                    rect = fitz.Rect(x / zoom_x, y / zoom_y, (x + w) / zoom_x, (y + h) / zoom_y)
-                    page.add_highlight_annot(rect)
-            if found_on_page:
-                app.logger.info(f"ÉXITO (OCR) en página {page.number + 1}.")
-        except Exception as e:
-            app.logger.error(f"Error durante el proceso de OCR: {e}")
-    else:
-        app.logger.warning(f"OCR no disponible o mal configurado. Saltando Estrategia 3.")
+            # 2. ENCONTRAR PARA RESALTAR: Ahora que sabemos que existe, buscamos el texto original para obtener las coordenadas.
+            # Intentamos buscar la versión normal y la versión con espacios.
+            
+            # Intento 1: Búsqueda Normal
+            instances = page.search_for(code, flags=re.IGNORECASE)
+            if instances:
+                found_on_page = True
+                for inst in instances:
+                    page.add_highlight_annot(inst)
+                app.logger.info(f"Resaltado con búsqueda normal para '{code}'.")
+
+            # Intento 2: Búsqueda con Espaciado
+            spaced_out_code = " ".join(list(code))
+            instances_spaced = page.search_for(spaced_out_code, flags=re.IGNORECASE)
+            if instances_spaced:
+                found_on_page = True
+                for inst in instances_spaced:
+                    page.add_highlight_annot(inst)
+                app.logger.info(f"Resaltado con búsqueda espaciada para '{code}'.")
+            
+            # Si se encontró en el texto limpio pero no se pudo resaltar, dejar un aviso.
+            if not found_on_page:
+                 app.logger.warning(f"Se encontró una coincidencia para '{code}', pero no se pudo localizar el área exacta en el PDF para resaltar.")
 
     return found_on_page
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
     if request.method == 'POST':
+        app.logger.info("="*50)
+        app.logger.info("Nueva solicitud POST recibida.")
+
         if 'pdf_file' not in request.files or 'specific_codes' not in request.form:
+             app.logger.error("Solicitud inválida: Faltan 'pdf_file' o 'specific_codes'.")
              return "Solicitud inválida: Faltan 'pdf_file' o 'specific_codes'.", 400
         
         file = request.files['pdf_file']
         specific_codes_str = request.form.get('specific_codes', '')
 
         if file.filename == '' or not specific_codes_str.strip():
+            app.logger.error("Archivo PDF o códigos no proporcionados.")
             return "Archivo PDF o códigos no proporcionados.", 400
 
         try:
@@ -120,7 +90,7 @@ def index():
             
             if pages_with_highlights_indices:
                 new_doc = fitz.open()
-                new_doc.insert_pdf(doc, from_page_p=pages_with_highlights_indices)
+                new_doc.insert_pdf(doc, from_page=pages_with_highlights_indices[0], to_pages=pages_with_highlights_indices)
                 output_pdf_bytes = new_doc.tobytes(garbage=4, deflate=True, clean=True)
                 new_doc.close()
             else:
